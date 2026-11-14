@@ -300,6 +300,59 @@ hide_stuff_apply() {
 	endgroup
 }
 
+# ================================================================ reboot hook
+#
+# The manager and the kernel hand each other an anon fd through reboot(2) with
+# a magic pair (KSU_INSTALL_MAGIC1/2), so every non-kprobe build needs a call
+# site in kernel/reboot.c. KernelSU-Next even refuses to build without it
+# (kernel/Kbuild greps for the symbol). The per-variant vendor patches do not
+# always carry this hunk, so add it here for all of them.
+reboot_hook_apply() {
+	local rb="${KERNEL_DIR}/kernel/reboot.c"
+	group "Adding sys_reboot supercall hook"
+
+	if [ ! -f "$rb" ]; then
+		warn "kernel/reboot.c not found; skipping the sys_reboot hook"
+		endgroup; return 0
+	fi
+	if grep -q 'ksu_handle_sys_reboot' "$rb"; then
+		info "sys_reboot hook is already present"
+		endgroup; return 0
+	fi
+	if ! grep -q 'SYSCALL_DEFINE4(reboot' "$rb"; then
+		warn "no SYSCALL_DEFINE4(reboot) anchor in kernel/reboot.c; skipping"
+		endgroup; return 0
+	fi
+
+	local tmp
+	tmp=$(mktemp)
+	awk '
+		/SYSCALL_DEFINE4\(reboot/ {
+			print "#ifdef CONFIG_KSU"
+			print "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);"
+			print "#endif"
+			infn = 1
+		}
+		infn == 1 && !done && $0 == "\tint ret = 0;" {
+			print
+			print "#ifdef CONFIG_KSU"
+			print "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"
+			print "#endif"
+			done = 1
+			next
+		}
+		{ print }
+	' "$rb" >"$tmp"
+
+	if ! grep -q 'ksu_handle_sys_reboot' "$tmp"; then
+		rm -f "$tmp"
+		die "failed to insert the sys_reboot hook into kernel/reboot.c"
+	fi
+	mv "$tmp" "$rb"
+	ok "sys_reboot hook inserted into kernel/reboot.c"
+	endgroup
+}
+
 # Manual/syscall hook patches for pre-GKI trees, used when the fork expects the
 # hooks to already exist in the kernel source rather than hooking via kprobes.
 hooks_patch_apply() {
@@ -307,6 +360,8 @@ hooks_patch_apply() {
 	kver=$(kernel_version "$KERNEL_DIR") || return 0
 
 	group "Applying manual syscall hooks (kernel ${kver})"
+
+	reboot_hook_apply
 
 	# ReSukiSU publishes scope-minimised hook patches keyed by kernel version.
 	if [ "$variant" = "resukisu" ]; then
